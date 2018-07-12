@@ -1,0 +1,189 @@
+---
+title: 'Анализ данных Мониторинга эффективности вузов 2017 г.'
+subtitle: 'Аттестационная работа'
+author: 'Екатерина Дьяченко'
+output: 
+  
+  html_document:
+    toc: TRUE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+```{r , echo = FALSE}
+
+library(tidyverse)
+library(rio)
+library(skimr)
+library(naniar)
+
+library(corrplot) # визуализация корреляций
+library(factoextra) # визуализации kmeans, pca
+library(dendextend) # визуализация дендрограмм
+
+library(GGally) # больше готовых графиков
+library(sjPlot) # ещё больше графиков
+
+library(lmtest) # диагностика линейных моделей
+library(sjstats) # удобные мелкие функции для работы с моделями
+library(sandwich) # оценка Var для гетероскедастичности
+library(estimatr) # модели с робастными ошибками
+
+library(caret) # пакет для подбора параметров разных моделей
+library(FFTrees) # быстрые деревья
+library(margins) # для подсчёта предельных эффектов
+library(rpart.plot) # для картинок деревьев
+library(plotROC) # визуализация ROC-кривой
+library(ggeffects) # графики для предельных эффектов
+library(MLmetrics) # метрики качества
+library(ranger) # строим деревья
+
+```
+
+## 1. Обработка данных
+
+Считываем данные Мониторинга эффективности вузов из файла excel и переименовываем переменные. 
+
+```{r , echo = FALSE}
+
+monitoring <- import('monitoring.xlsx')
+
+fullnames <- c("InstID", "Inst", "Общая численность студентов, обучающихся по программам бакалавриата, специалитета, магистратуры", "Общая численность иностранных студентов, обучающихся по программам бакалавриата, специалитета, магистратуры", "Общая численность работников образовательной организации (без внешних совместителей и работающих по договорам ГПХ)", "Общая численность ППС (без внешних совместителей и работающих по договорам ГПХ)", "Доля ППС, имеющих ученые степени", "Доля ППС возрастной категории моложе 40 лет", "Средний балл ЕГЭ студентов, принятых на обучение по программам бакалавриата и специалитета, по всем формам обучения", "Общее количество публикаций организации в расчете на 100 НПР", "Общий объем средств, поступивших (за отчетный год) от выполнения НИОКР, выполненных собственными силами", "Доходы вуза  из всех источников", "Доля внебюджетных средств в доходах от образовательной деятельности", "Доля внебюджетных средств в доходах от научных исследований и разработок", "Средняя заработная плата ППС (без внешних совместителей и работающих по договорам ГПХ)", "Тип")
+
+shortnames <- c("InstID", "Inst", "st_all", "st_for", "staff", "pps", "pps_st", "pps_40", "ege", "pub100", "money_sc", "money", "money_ex", "money_sc_ex", "salary", "type")
+
+table <- data.frame(shortnames, fullnames)
+
+knitr::kable(table, caption = "Переменные, включенные в анализ")
+
+colnames(monitoring) <- shortnames
+
+```
+
+## 2. Описательный анализ данных
+
+В [Мониторинге эффективности вузов](https://http://indicators.miccedu.ru/monitoring/?m=vpo) за 2017 г. содержатся данные по `r count(monitoring)` вузам без учета филиалов. 
+
+```{r }
+glimpse(monitoring)
+skim(monitoring)
+
+vis_miss(monitoring, cluster = TRUE)
+
+# Переводим переменную "тип" в факторную
+monitoring <- mutate(monitoring, type = factor(type))
+
+
+# Гистограммы для всех числовых переменных
+
+monitoring %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+
+# Диаграммы рассеяния для размера вуза и разных видов результативности вуза
+
+qplot(data = monitoring, x = staff, y = ege)
+
+qplot(data = monitoring, x = staff, y = pub100)
+
+qplot(data = monitoring, x = staff, y = salary)
+
+# Корреляционная матрица количественных переменных
+
+monitoring_num <- Filter(is.numeric, monitoring)
+
+mat_cor <- cor(monitoring_num, use = "complete.obs")
+
+corrplot(mat_cor, method = 'number')
+
+```
+
+## 3. Кластеризация
+
+Кластеризуем вузы по трем показателям результативности - среднему баллу ЕГЭ принимаемых студентов, общим доходам, числу публикаций на 100 НПР.
+
+```{r }
+# Отбираем нужные переменные и идентификатор вуза
+
+for_clust <- select(monitoring, InstID, ege, money, pub100)
+
+# Удаляем пустые строки
+
+for_clust2 <- subset(for_clust, ege >= 0 | money >= 0 | pub100 >= 0)
+
+# Убираем идентификатор
+# !!! Если кластеризую данные, включающие идентификатор вуза (переменная InstID), то результаты получаются другие, хотя это текстовая переменная, и должна игнорироваться в кластеризации.
+
+for_clust3 <- select(for_clust2, ege, money, pub100)
+
+# Стандартизируем переменные
+
+for_clust_stand <- mutate_if(for_clust3, is.numeric, ~ as.vector(scale(.)))
+
+# Кластеризуем
+hier_clus <- hcut(for_clust_stand)
+
+# Дендрограмма
+
+fviz_dend(hier_clus)
+
+# Определяем оптимальное число кластеров
+
+g1 <- fviz_nbclust(for_clust3, hcut, method = 'wss') +
+  labs(title = 'Зависимость WSS от числа кластеров',
+       x = 'Число кластеров',
+       y = 'Внутригрупповая сумма квадратов расстояний')
+g1
+
+# Визуализируем 5 кластеров в осях главных компонент 
+#(при более мелких разбаениях внутригрупповая сумма квадратов 
+# расстояний почти не падает).
+# Сначала снова проведем кластеризацию - уже на 5 кластеров
+
+hier_clus_5 <- hcut(for_clust3, stand = TRUE, k = 5)
+
+fviz_cluster(object = hier_clus_5, data = for_clust2,
+             ellipse.type = 'convex')
+
+# Добавляем номер кластера сначала в промежуточный массив, потом в исходный
+
+for_clust2_plus <- mutate(for_clust2, cluster = hier_clus_5$cluster)
+
+monitoring <- left_join(monitoring, select(for_clust2_plus, c(cluster, InstID)), by = 'InstID')
+
+
+# Показываем характеристики кластеров и таблицу сопряженности типа вуза и кластера.
+
+report <- group_by(monitoring, cluster) %>%
+  summarise(mean_ege = mean(ege), mean_money = mean(money), mean_pub100 = mean(pub100))
+
+knitr::kable(report)
+
+knitr::kable(table(monitoring$type, monitoring$cluster))
+
+```
+
+## 4. Линейная регрессия
+
+This is an R Markdown document. 
+
+```{r }
+
+```
+## 5. Классификация
+
+This is an R Markdown document. 
+
+```{r }
+
+```
+
+
